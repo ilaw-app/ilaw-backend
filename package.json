@@ -25,7 +25,8 @@
     "typecheck": "tsc --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "test:coverage": "vitest run --coverage",
-    "quality": "npm run lint && npm run typecheck && npm run typecheck:test && npm run test:coverage && npm run build"
+    "quality": "npm run lint && npm run typecheck && npm run typecheck:test && npm run test:coverage && npm run build",
+    "secrets:openai": "bash scripts/rotate-openai-key.sh"
   },
   "keywords": [],
   "author": "",

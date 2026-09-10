@@ -36,7 +36,11 @@ const CATEGORY_CONFIG: Record<string, { slug: string; order: number; displayName
   '출생/양육':        { slug: 'birth-and-parenting', order: 6 },
   '법정대리인':       { slug: 'parental-rights',     order: 7 },
   '학교폭력':         { slug: 'school-violence',     order: 8 },
-  '생활 지원':        { slug: 'out-of-school-youth', order: 9, displayName: '학교 밖 청소년' },
+  // 2026-09: 노션에서 '생활 지원'이 복지/생계 지원 카테고리로 새로 갈라져 나갔다.
+  // 학교 밖 청소년 콘텐츠는 같은 이름의 카테고리로 옮겨졌으므로, 프론트 라우팅과
+  // 에셋이 물려 있는 slug(out-of-school-youth)는 그대로 두고 노션 쪽 키만 바꿔 받는다.
+  '학교 밖 청소년':   { slug: 'out-of-school-youth', order: 9 },
+  '생활 지원':        { slug: 'life-support',        order: 10 },
 };
 
 let checkedUploads = 0;
@@ -98,7 +102,9 @@ async function parseHtmlFile(htmlFile: string, uploadImages = true) {
     const label = $(row).find('th').text().trim();
     const value = $(row).find('td').text().trim();
     if (label === 'order') order = parseInt(value) || 0;
-    if (label === '카테고리') categoryName = value.trim();
+    // 노션 속성명이 '카테고리' → 'category'로 바뀌었는데 기존 export 파일은 아직
+    // 옛 이름을 쓴다. 재export 전까지 두 이름이 섞여 있어 둘 다 받는다.
+    if (label === '카테고리' || label === 'category') categoryName = value.trim();
   });
 
   const pageBody = $('.page-body');
