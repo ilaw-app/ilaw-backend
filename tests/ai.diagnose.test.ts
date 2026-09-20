@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const openAiCreateMock = vi.hoisted(() => vi.fn());
 const retrieveCandidatesMock = vi.hoisted(() => vi.fn());
+const retrieveQnaCandidatesMock = vi.hoisted(() => vi.fn());
+const loadQnaBodiesMock = vi.hoisted(() => vi.fn());
 const prismaMock = vi.hoisted(() => ({
   manualArticle: { findMany: vi.fn() },
   agency: { findMany: vi.fn() },
@@ -14,8 +16,12 @@ vi.mock('openai', () => ({
 }));
 vi.mock('../src/prisma/client', () => ({ default: prismaMock }));
 vi.mock('../src/services/ai.retrieval', () => ({ retrieveCandidates: retrieveCandidatesMock }));
+vi.mock('../src/services/ai.qna', () => ({
+  retrieveQnaCandidates: retrieveQnaCandidatesMock,
+  loadQnaBodies: loadQnaBodiesMock,
+}));
 
-import { diagnose } from '../src/services/ai.service';
+import { diagnose, pickVariant } from '../src/services/ai.service';
 
 function routerResponse(obj: unknown) {
   return { choices: [{ message: { content: JSON.stringify(obj) } }] };
@@ -38,6 +44,8 @@ beforeEach(() => {
   delete process.env.AI_MULTITURN_ENABLED;
   delete process.env.AI_CRISIS_ENABLED;
   retrieveCandidatesMock.mockResolvedValue([]);
+  retrieveQnaCandidatesMock.mockResolvedValue([]);
+  loadQnaBodiesMock.mockResolvedValue([]);
   prismaMock.manualArticle.findMany.mockResolvedValue([]);
   prismaMock.agency.findMany.mockResolvedValue([]);
 });
@@ -53,6 +61,17 @@ describe('diagnose 상태머신', () => {
     expect(result.suggestions).toEqual([]);
     expect(result.chatEnded).toBe(true);
     expect(openAiCreateMock).toHaveBeenCalledOnce(); // 라우터만
+  });
+
+  it('unrelated(greeting): 거절 문구 대신 따뜻한 인사로 답한다', async () => {
+    openAiCreateMock.mockResolvedValueOnce(routerResponse({ status: 'unrelated', unrelatedKind: 'greeting' }));
+
+    const result = await diagnose('안녕하세요');
+
+    expect(result.status).toBe('unrelated');
+    expect(result.legalAdvice).not.toContain('법률 관련 상황만');
+    expect(result.legalAdvice).toMatch(/이야기해 주세요|들려주세요|말씀해 주세요/);
+    expect(openAiCreateMock).toHaveBeenCalledOnce();
   });
 
   it('router JSON 파싱 실패 시 안전 폴백(unrelated)으로 처리한다', async () => {
@@ -186,5 +205,63 @@ describe('diagnose 상태머신', () => {
     // isCrisis=true여도 멀티턴 off면 crisis 승격/ chatEnded=false 하지 않음
     expect(result.status).toBe('relevant');
     expect(result.chatEnded).toBe(true);
+  });
+});
+
+describe('diagnose Q&A 근거', () => {
+  const QNA_CANDIDATE = { id: 1, title: '알바비를 못 받았어요', category: '노동' };
+  const QNA_BODY = { id: 1, title: '알바비를 못 받았어요', content: '편의점에서 일했는데…', answer: '노동청에 진정을 제기할 수 있습니다.' };
+
+  it('라우터가 고른 Q&A를 생성 근거와 qa suggestion으로 쓴다(매뉴얼과 id가 겹쳐도 구분)', async () => {
+    retrieveCandidatesMock.mockResolvedValue([LABOR_CANDIDATE]); // manual id=1
+    retrieveQnaCandidatesMock.mockResolvedValue([QNA_CANDIDATE]); // qa id=1
+    loadQnaBodiesMock.mockResolvedValue([QNA_BODY]);
+    openAiCreateMock
+      .mockResolvedValueOnce(routerResponse({
+        status: 'relevant', userRole: '피해자', situationSummary: '사용자는 알바비를 받지 못했습니다.',
+        references: [{ type: 'qa', id: 1 }],
+      }))
+      .mockResolvedValueOnce(textResponse('노동청에 진정을 제기할 수 있어요.'));
+
+    const result = await diagnose('알바비를 못 받았어요');
+
+    expect(loadQnaBodiesMock).toHaveBeenCalledWith([1]);
+    expect(prismaMock.manualArticle.findMany).not.toHaveBeenCalled(); // type=qa 는 매뉴얼 선택이 아니다
+    expect(result.suggestions).toEqual([{ type: 'qa', id: 1, label: QNA_BODY.title }]);
+
+    const routerSystem = openAiCreateMock.mock.calls[0][0].messages[0].content as string;
+    expect(routerSystem).toContain('[QNA id=1]');
+    const generateSystem = openAiCreateMock.mock.calls[1][0].messages[0].content as string;
+    expect(generateSystem).toContain('[변호사 답변 Q&A]');
+    expect(generateSystem).toContain(QNA_BODY.answer);
+  });
+
+  it('후보에 없는 Q&A id는 버린다', async () => {
+    retrieveQnaCandidatesMock.mockResolvedValue([QNA_CANDIDATE]);
+    openAiCreateMock.mockResolvedValueOnce(routerResponse({
+      status: 'relevant', userRole: '피해자', situationSummary: '사용자는 …', references: [{ type: 'qa', id: 999 }],
+    }));
+
+    const result = await diagnose('알바비를 못 받았어요');
+
+    expect(loadQnaBodiesMock).toHaveBeenCalledWith([]);
+    expect(result.suggestions).toEqual([]);
+  });
+
+  it('Q&A 후보가 없으면 라우터 프롬프트에 Q&A 섹션이 없다', async () => {
+    openAiCreateMock.mockResolvedValueOnce(routerResponse({ status: 'unrelated' }));
+    await diagnose('안녕하세요');
+    expect(openAiCreateMock.mock.calls[0][0].messages[0].content).not.toContain('후보 Q&A 목록');
+  });
+});
+
+describe('pickVariant', () => {
+  it('직전 답변과 같은 문장은 고르지 않는다', () => {
+    const variants = ['가', '나', '다'];
+    for (let i = 0; i < 20; i += 1) expect(pickVariant(variants, '가')).not.toBe('가');
+  });
+
+  it('후보가 하나뿐이면 그대로 반환한다', () => {
+    expect(pickVariant(['가'], '가')).toBe('가');
   });
 });

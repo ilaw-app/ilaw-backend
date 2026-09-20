@@ -148,6 +148,9 @@ model QnAPost {
   category   String
   status     String     @default("pending")
   imageUrls  String[]   @default([])
+  // AI 챗봇 근거 검색용(pgvector). 변호사 답변이 달린 글만 임베딩한다. 쓰기는 ai.qna.ts / backfill 스크립트.
+  embedding      Unsupported("vector(1536)")?
+  embedInputHash String?
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
   answer    QnAAnswer?

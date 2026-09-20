@@ -1,7 +1,8 @@
 import type OpenAI from 'openai';
 import prisma from '../prisma/client';
 import { retrieveCandidates, type Candidate } from './ai.retrieval';
-import { buildRouterPrompt, buildGeneratePrompt } from './ai.prompts';
+import { buildRouterPrompt, buildGeneratePrompt, buildQnaContentBlock } from './ai.prompts';
+import { loadQnaBodies, retrieveQnaCandidates } from './ai.qna';
 import { detectCrisis, hotlinesFor } from './ai.crisis';
 import { getAgencies } from './manual.service';
 import { logDiagnosis } from './ai.metrics';
@@ -161,6 +162,7 @@ export type DiagnoseStatus = 'relevant' | 'unrelated' | 'needs_clarification' | 
 // suggestions 계약: manual은 Phase 1부터, agency/hotline은 Phase 2(위기대응)에서 채워진다.
 export type Suggestion =
   | { type: 'manual'; id: number; label: string }
+  | { type: 'qa'; id: number; label: string }
   | { type: 'agency'; id: number; label: string; contact: string; region?: string }
   | { type: 'hotline'; label: string; phone: string };
 
@@ -173,8 +175,31 @@ export interface DiagnoseResult {
   chatEnded: boolean;
 }
 
-const UNRELATED_MESSAGE =
-  '저는 법률 관련 상황만 도와드릴 수 있어요. 법률적으로 어려운 상황이 생기면 언제든지 말씀해 주세요.';
+// 무관한 메시지에 대한 고정 응답. 모델에 맡기지 않는 이유: 웹앱은 매뉴얼 범위 밖의 말을 하지 않는다는
+// 정책을 코드로 보장하기 위해서다. 다만 매번 같은 문장이면 기계적으로 느껴져 여러 표현 중에서 고른다.
+// 기존 계약(테스트·프론트)이 기대하는 "법률 관련 상황만" 문구는 off_topic 의 모든 표현에 유지한다.
+const OFF_TOPIC_MESSAGES = [
+  '저는 법률 관련 상황만 도와드릴 수 있어요. 법률적으로 어려운 상황이 생기면 언제든지 말씀해 주세요.',
+  '그 이야기는 제가 잘 도와드리기 어려워요. 저는 법률 관련 상황만 안내해 드릴 수 있거든요. 혹시 곤란하거나 걱정되는 일이 있다면 편하게 들려주세요.',
+  '아쉽지만 그 부분은 제가 답해 드리기 어려워요. 저는 법률 관련 상황만 도와드리고 있어요. 학교·집·일터에서 힘든 일이 있다면 언제든 이야기해 주세요.',
+];
+const THANKS_MESSAGES = [
+  '도움이 되었다면 다행이에요. 또 궁금하거나 걱정되는 일이 생기면 언제든 찾아와 주세요.',
+  '별말씀을요. 혼자 고민하지 마시고, 필요할 때 언제든 다시 이야기해 주세요.',
+  '이야기 나눠 주셔서 제가 더 고마워요. 앞으로도 곤란한 일이 있으면 편하게 말씀해 주세요.',
+];
+const GREETING_MESSAGES = [
+  '반가워요! 요즘 걱정되거나 곤란한 일이 있다면 편하게 이야기해 주세요. 제가 함께 방법을 찾아볼게요.',
+  '이렇게 말 걸어 주셔서 고마워요. 혹시 마음에 걸리는 일이 있다면 천천히 들려주세요.',
+  '저도 반가워요. 도움이 필요한 일이 생기면 언제든 말씀해 주세요. 혼자 고민하지 않으셔도 돼요.',
+];
+
+// 같은 사용자에게 직전과 같은 문장이 연달아 나가지 않도록, 직전 답변과 다른 것 중에서 고른다.
+export function pickVariant(variants: string[], previous?: string, random: () => number = Math.random): string {
+  const pool = variants.filter(v => v !== previous);
+  const from = pool.length > 0 ? pool : variants;
+  return from[Math.floor(random() * from.length)] ?? variants[0];
+}
 // 관련 상황으로 판단됐지만 근거 매뉴얼을 확정하지 못한 경우의 안전 폴백(빈 문자열 금지).
 const NO_MATCH_MESSAGE =
   '말씀해 주신 상황을 살펴봤어요. 다만 정확한 안내를 위해 조금 더 구체적으로 상황을 알려주시면 더 도움이 될 것 같아요. 급하신 경우 전문 변호사 상담을 권해드려요.';
@@ -220,12 +245,18 @@ interface RouterResult {
   status: 'relevant' | 'unrelated' | 'needs_clarification';
   situationSummary: string;
   selectedIds: number[];
+  selectedQnaIds: number[];
   isCrisis: boolean;
   followUpQuestion: string;
   userRole: string;
+  unrelatedKind: 'greeting' | 'thanks' | 'off_topic';
 }
 
-function parseRouterResponse(raw: string | null, candidateIds: Set<number>): RouterResult | null {
+function parseRouterResponse(
+  raw: string | null,
+  candidateIds: Set<number>,
+  qnaCandidateIds: Set<number> = new Set(),
+): RouterResult | null {
   try {
     const parsed: unknown = JSON.parse(raw ?? '{}');
     if (typeof parsed !== 'object' || parsed === null) return null;
@@ -235,25 +266,33 @@ function parseRouterResponse(raw: string | null, candidateIds: Set<number>): Rou
         ? value.status
         : 'unrelated';
 
-    const selectedIds: number[] = Array.isArray(value.references)
-      ? value.references
-          .filter((reference: unknown): reference is { type: 'manual'; id: number } =>
-            typeof reference === 'object'
-            && reference !== null
-            && (reference as Record<string, unknown>).type === 'manual'
-            && typeof (reference as Record<string, unknown>).id === 'number')
-          .map(reference => reference.id)
-          // 후보 밖의 환각 ID 방지: 실제 추천 후보에 포함된 것만 채택
-          .filter(id => candidateIds.has(id))
-      : [];
+    // 매뉴얼과 Q&A 는 id 공간이 겹치므로 type 별로 따로 뽑고, 각자의 후보 집합으로 환각 ID 를 거른다.
+    const referenceIds = (type: 'manual' | 'qa', allowed: Set<number>): number[] =>
+      Array.isArray(value.references)
+        ? value.references
+            .filter((reference: unknown): reference is { type: string; id: number } =>
+              typeof reference === 'object'
+              && reference !== null
+              && (reference as Record<string, unknown>).type === type
+              && typeof (reference as Record<string, unknown>).id === 'number')
+            .map(reference => reference.id)
+            // 후보 밖의 환각 ID 방지: 실제 추천 후보에 포함된 것만 채택
+            .filter(id => allowed.has(id))
+        : [];
+    const selectedIds = referenceIds('manual', candidateIds);
+    const selectedQnaIds = referenceIds('qa', qnaCandidateIds);
 
     return {
       status,
       situationSummary: typeof value.situationSummary === 'string' ? value.situationSummary : '',
       selectedIds,
+      selectedQnaIds,
       isCrisis: value.isCrisis === true,
       followUpQuestion: typeof value.followUpQuestion === 'string' ? value.followUpQuestion : '',
       userRole: typeof value.userRole === 'string' ? value.userRole : '',
+      unrelatedKind: value.unrelatedKind === 'greeting' || value.unrelatedKind === 'thanks'
+        ? value.unrelatedKind
+        : 'off_topic',
     };
   } catch {
     return null;
@@ -297,7 +336,17 @@ export async function diagnose(
 
   // ── 검색: 전 카테고리에서 관련 후보 압축(전체목록 주입 폐기) ──
   const tRetrieve = Date.now();
-  const candidates = await retrieveCandidates(message);
+  // 멀티턴의 후속 발화("어디에 신고해요?", "잘릴까봐 무서워요")는 그것만으로는 주제를 알 수 없어
+  // 다른 유형의 매뉴얼이 걸린다. 같은 대화의 직전 질문을 검색 질의에 붙여 주제를 이어 간다.
+  // (단발 모드의 history 는 대화 단위가 아니라 사용자의 최근 질문이라 섞으면 안 된다.)
+  const previousQuestion = multiTurn ? history[history.length - 1]?.question : undefined;
+  const retrievalQuery = previousQuestion ? `${previousQuestion} ${message}` : message;
+  // Q&A(변호사 답변) 후보는 플래그가 꺼져 있거나 실패하면 [] — 매뉴얼 경로에 영향을 주지 않는다.
+  const [candidates, qnaCandidates] = await Promise.all([
+    retrieveCandidates(retrievalQuery),
+    retrieveQnaCandidates(retrievalQuery),
+  ]);
+  const qnaCandidateIds = new Set(qnaCandidates.map(q => q.id));
   retrieveMs = Date.now() - tRetrieve;
   retrievedIds = candidates.map(c => c.id);
   const candidateIds = new Set(candidates.map(c => c.id));
@@ -322,7 +371,7 @@ export async function diagnose(
     max_completion_tokens: maxCompletionTokens(),
     response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: buildRouterPrompt(candidates, userLabel, { allowClarification: multiTurn }) },
+      { role: 'system', content: buildRouterPrompt(candidates, userLabel, { allowClarification: multiTurn, qnaCandidates }) },
       ...historyMessages,
       { role: 'user', content: message },
     ],
@@ -330,15 +379,18 @@ export async function diagnose(
   step1Ms = Date.now() - tStep1;
   step1Tokens = step1Res.usage?.total_tokens;
 
-  const router = parseRouterResponse(step1Res.choices[0].message.content, candidateIds);
+  const router = parseRouterResponse(step1Res.choices[0].message.content, candidateIds, qnaCandidateIds);
   if (router) userRoleForLog = router.userRole || undefined;
+
+  // unrelated 턴은 이력에 저장되지 않으므로 previous 는 대개 비지만, 저장 정책이 바뀌어도 반복을 피한다.
+  const previousAdvice = history[history.length - 1]?.legalAdvice;
 
   if (!router) {
     logger.error({ event: 'ai_router_parse_failed' });
     return finish({
       status: 'unrelated',
       situationSummary: '',
-      legalAdvice: UNRELATED_MESSAGE,
+      legalAdvice: pickVariant(OFF_TOPIC_MESSAGES, previousAdvice),
       suggestions: [],
       chatEnded: true,
     });
@@ -348,9 +400,13 @@ export async function diagnose(
     return finish({
       status: 'unrelated',
       situationSummary: '',
-      legalAdvice: UNRELATED_MESSAGE,
+      legalAdvice: pickVariant(
+        { greeting: GREETING_MESSAGES, thanks: THANKS_MESSAGES, off_topic: OFF_TOPIC_MESSAGES }[router.unrelatedKind],
+        previousAdvice,
+      ),
       suggestions: [],
-      chatEnded: true,
+      // 멀티턴에서는 인사 뒤에 바로 상황을 이어 말할 수 있어야 하므로 대화를 닫지 않는다.
+      chatEnded: !multiTurn,
     });
   }
 
@@ -389,9 +445,11 @@ export async function diagnose(
     : [];
 
   // ── GPT 2차(생성): 선택 매뉴얼 전문 근거 RAG 안내 ──
-  const contentBlocks = fullArticles
-    .map(a => `[매뉴얼] ${a.question}\n${a.content}`)
-    .join('\n\n---\n\n');
+  const qnaBodies = await loadQnaBodies(router.selectedQnaIds);
+  const contentBlocks = [
+    ...fullArticles.map(a => `[매뉴얼] ${a.question}\n${a.content}`),
+    ...qnaBodies.map(buildQnaContentBlock),
+  ].join('\n\n---\n\n');
 
   let legalAdvice = '';
   if (contentBlocks) {
@@ -400,7 +458,7 @@ export async function diagnose(
       model: generationModel(),
       max_completion_tokens: maxCompletionTokens(),
       messages: [
-        { role: 'system', content: buildGeneratePrompt(contentBlocks, userLabel, { crisis }) },
+        { role: 'system', content: buildGeneratePrompt(contentBlocks, userLabel, { crisis, multiTurn }) },
         ...historyMessages,
         { role: 'user', content: message },
       ],
@@ -416,9 +474,11 @@ export async function diagnose(
   // ── suggestions 조립 ──
   // 기관(agency) 연락처는 고위험 여부와 무관하게 항상 노출한다.
   // 긴급 핫라인(hotline)은 위기 상황에서만 최상단에 붙인다.
-  const manualSuggestions: Suggestion[] = selectedCandidates.map(c => ({
-    type: 'manual', id: c.id, label: c.question,
-  }));
+  // Q&A 는 매뉴얼 뒤에 붙인다(검증된 공식 콘텐츠가 먼저). 프론트는 /qna/:id 로 연결한다.
+  const manualSuggestions: Suggestion[] = [
+    ...selectedCandidates.map((c): Suggestion => ({ type: 'manual', id: c.id, label: c.question })),
+    ...qnaBodies.map((q): Suggestion => ({ type: 'qa', id: q.id, label: q.title })),
+  ];
 
   const agencyRows = (await Promise.all(selectedSlugs.map(slug => getAgencies(slug)))).flat();
   // 사용자 지역과 일치하는 기관을 앞으로.

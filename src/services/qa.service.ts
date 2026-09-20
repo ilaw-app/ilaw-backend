@@ -2,6 +2,9 @@ import prisma from '../prisma/client';
 import { expandQuery } from './synonyms';
 import { scoreAndRank } from './search.util';
 import { Pagination, paginationArgs } from '../utils/validation';
+import { embedQnaPost } from './ai.qna';
+import { safeAiErrorFields } from './ai.logging';
+import { logger } from '../middlewares/logging';
 
 export async function listQAPosts(userId?: string, pagination: Pagination = { page: 1, limit: 20 }) {
   const posts = await prisma.qnAPost.findMany({
@@ -149,6 +152,14 @@ export async function getQAPostAnswerState(id: number) {
   });
 }
 
+// AI 챗봇 근거용 임베딩 갱신. 답변 등록·수정 응답을 늦추거나 실패시키지 않도록 분리해서 돌린다
+// (플래그가 꺼져 있으면 no-op, 누락분은 ai:embed 백필이 메운다).
+function refreshQnaEmbedding(postId: number): void {
+  void embedQnaPost(postId).catch((error: unknown) => {
+    logger.error({ event: 'ai_qna_embed_failed', postId, ...safeAiErrorFields(error, 'qna_embed') });
+  });
+}
+
 export async function updateQAAnswer(postId: number, lawyerId: string, content: string): Promise<boolean> {
   const lawyer = await prisma.user.findUnique({ where: { id: lawyerId }, select: { role: true } });
   if (lawyer?.role !== 'lawyer') return false;
@@ -156,6 +167,7 @@ export async function updateQAAnswer(postId: number, lawyerId: string, content: 
   const answer = await prisma.qnAAnswer.findUnique({ where: { postId }, select: { lawyerId: true } });
   if (!answer || answer.lawyerId !== lawyerId) return false;
   await prisma.qnAAnswer.update({ where: { postId }, data: { content } });
+  refreshQnaEmbedding(postId);
   return true;
 }
 
@@ -266,5 +278,6 @@ export async function createQAAnswer(postId: number, lawyerId: string, content: 
     prisma.qnAAnswer.create({ data: { postId, lawyerId, content } }),
     prisma.qnAPost.update({ where: { id: postId }, data: { status: 'answered' } }),
   ]);
+  refreshQnaEmbedding(postId);
   return answer;
 }
