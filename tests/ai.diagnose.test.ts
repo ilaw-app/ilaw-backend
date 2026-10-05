@@ -70,7 +70,7 @@ describe('diagnose 상태머신', () => {
 
     expect(result.status).toBe('unrelated');
     expect(result.legalAdvice).not.toContain('법률 관련 상황만');
-    expect(result.legalAdvice).toMatch(/이야기해 주세요|들려주세요|말씀해 주세요/);
+    expect(result.legalAdvice).toMatch(/이야기해 줘|들려줘|말해 줘/);
     expect(openAiCreateMock).toHaveBeenCalledOnce();
   });
 

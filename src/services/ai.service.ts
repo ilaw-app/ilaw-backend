@@ -146,13 +146,24 @@ function maxCompletionTokens(): number {
   return positiveInteger(process.env.AI_MAX_COMPLETION_TOKENS, DEFAULT_MAX_COMPLETION_TOKENS);
 }
 
-// 라우터(분류·매뉴얼 선택)는 정확도가 중요해 gpt-4o, 생성은 비용을 위해 gpt-4o-mini.
+// 라우터(분류·매뉴얼 선택)는 정확도가 중요해 gpt-5.4, 생성은 속도·비용을 위해 gpt-5.4-mini.
+// (2026-10-06 gpt-4o/gpt-4o-mini 에서 교체. 첫 토큰 실측: gpt-5.4-mini/none 0.6s, gpt-4o-mini 1.0s.)
 // 둘 다 env로 오버라이드 가능.
 function routerModel(): string {
-  return process.env.AI_ROUTER_MODEL || 'gpt-4o';
+  return process.env.AI_ROUTER_MODEL || 'gpt-5.4';
 }
 function generationModel(): string {
-  return process.env.AI_GENERATION_MODEL || 'gpt-4o-mini';
+  return process.env.AI_GENERATION_MODEL || 'gpt-5.4-mini';
+}
+
+// gpt-5 계열은 기본값이 '생각한 뒤 답하기'라 느리다. 라우터는 분류 정확도를 위해 low,
+// 생성은 근거 자료를 옮겨 쓰는 일이라 none 으로 둔다. gpt-4 계열에는 이 파라미터가 없다.
+type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
+function reasoningOptions(model: string, envName: string, fallback: ReasoningEffort): { reasoning_effort?: ReasoningEffort } {
+  if (!model.startsWith('gpt-5')) return {};
+  const raw = process.env[envName]?.trim();
+  const effort = (['none', 'minimal', 'low', 'medium', 'high'] as const).find((e) => e === raw) ?? fallback;
+  return { reasoning_effort: effort };
 }
 
 // ── 메인 로직 ──────────────────────────────────────────────────
@@ -178,20 +189,21 @@ export interface DiagnoseResult {
 // 무관한 메시지에 대한 고정 응답. 모델에 맡기지 않는 이유: 웹앱은 매뉴얼 범위 밖의 말을 하지 않는다는
 // 정책을 코드로 보장하기 위해서다. 다만 매번 같은 문장이면 기계적으로 느껴져 여러 표현 중에서 고른다.
 // 기존 계약(테스트·프론트)이 기대하는 "법률 관련 상황만" 문구는 off_topic 의 모든 표현에 유지한다.
+// 말투: 웹앱도 인형과 같은 '친구' 반말(2026-10-06 결정. 그전엔 웹앱만 존댓말이었다).
 const OFF_TOPIC_MESSAGES = [
-  '저는 법률 관련 상황만 도와드릴 수 있어요. 법률적으로 어려운 상황이 생기면 언제든지 말씀해 주세요.',
-  '그 이야기는 제가 잘 도와드리기 어려워요. 저는 법률 관련 상황만 안내해 드릴 수 있거든요. 혹시 곤란하거나 걱정되는 일이 있다면 편하게 들려주세요.',
-  '아쉽지만 그 부분은 제가 답해 드리기 어려워요. 저는 법률 관련 상황만 도와드리고 있어요. 학교·집·일터에서 힘든 일이 있다면 언제든 이야기해 주세요.',
+  '나는 법률 관련 상황만 도와줄 수 있어. 법적으로 어려운 일이 생기면 언제든지 말해 줘.',
+  '그 얘기는 내가 잘 도와주기 어려워. 나는 법률 관련 상황만 안내할 수 있거든. 혹시 곤란하거나 걱정되는 일이 있으면 편하게 들려줘.',
+  '아쉽지만 그 부분은 내가 답해 주기 어려워. 나는 법률 관련 상황만 도와주고 있어. 학교나 집, 일하는 곳에서 힘든 일이 있으면 언제든 이야기해 줘.',
 ];
 const THANKS_MESSAGES = [
-  '도움이 되었다면 다행이에요. 또 궁금하거나 걱정되는 일이 생기면 언제든 찾아와 주세요.',
-  '별말씀을요. 혼자 고민하지 마시고, 필요할 때 언제든 다시 이야기해 주세요.',
-  '이야기 나눠 주셔서 제가 더 고마워요. 앞으로도 곤란한 일이 있으면 편하게 말씀해 주세요.',
+  '도움이 됐다면 다행이야. 또 궁금하거나 걱정되는 일이 생기면 언제든 찾아와.',
+  '별말을. 혼자 고민하지 말고, 필요할 때 언제든 다시 이야기해 줘.',
+  '이야기 나눠 줘서 내가 더 고마워. 앞으로도 곤란한 일이 있으면 편하게 말해 줘.',
 ];
 const GREETING_MESSAGES = [
-  '반가워요! 요즘 걱정되거나 곤란한 일이 있다면 편하게 이야기해 주세요. 제가 함께 방법을 찾아볼게요.',
-  '이렇게 말 걸어 주셔서 고마워요. 혹시 마음에 걸리는 일이 있다면 천천히 들려주세요.',
-  '저도 반가워요. 도움이 필요한 일이 생기면 언제든 말씀해 주세요. 혼자 고민하지 않으셔도 돼요.',
+  '반가워! 요즘 걱정되거나 곤란한 일이 있으면 편하게 이야기해 줘. 같이 방법을 찾아볼게.',
+  '말 걸어 줘서 고마워. 혹시 마음에 걸리는 일이 있으면 천천히 들려줘.',
+  '나도 반가워. 도움이 필요한 일이 생기면 언제든 말해 줘. 혼자 고민하지 않아도 돼.',
 ];
 
 // 같은 사용자에게 직전과 같은 문장이 연달아 나가지 않도록, 직전 답변과 다른 것 중에서 고른다.
@@ -202,10 +214,10 @@ export function pickVariant(variants: string[], previous?: string, random: () =>
 }
 // 관련 상황으로 판단됐지만 근거 매뉴얼을 확정하지 못한 경우의 안전 폴백(빈 문자열 금지).
 const NO_MATCH_MESSAGE =
-  '말씀해 주신 상황을 살펴봤어요. 다만 정확한 안내를 위해 조금 더 구체적으로 상황을 알려주시면 더 도움이 될 것 같아요. 급하신 경우 전문 변호사 상담을 권해드려요.';
+  '네가 말해 준 상황을 살펴봤어. 다만 정확하게 안내하려면 상황을 조금 더 구체적으로 알려 주면 좋겠어. 급하면 전문 변호사 상담을 받아 보는 걸 추천해.';
 // 위기 상황에서 안내 본문이 비더라도 반드시 반환하는 안전 우선 폴백.
 const CRISIS_MESSAGE =
-  '지금 위험한 상황이라면 망설이지 말고 즉시 112에 신고해 주세요. 아래 긴급 연락처로 도움을 받으실 수 있어요. 혼자 감당하지 마시고 꼭 도움을 요청하세요.';
+  '지금 위험한 상황이라면 망설이지 말고 바로 112에 신고해. 아래 긴급 연락처로 도움을 받을 수 있어. 혼자 감당하지 말고 꼭 도움을 요청해.';
 
 // 전화번호가 달린 suggestion(핫라인 + 지역 기관)은 답변당 총 2개까지만 노출한다.
 // 위기 상황에서 핫라인이 카테고리별로 4~6개까지 붙어 번호가 쏟아지던 문제를 막는다.
@@ -306,7 +318,8 @@ export async function diagnose(
   opts: { region?: string; priorStatus?: string; userId?: string; conversationId?: string } = {},
 ): Promise<DiagnoseResult> {
   const startedAt = Date.now();
-  const userLabel = nickname ? `${nickname}님` : '사용자';
+  // 친구 말투라 '님'을 붙이지 않는다. 닉네임이 없으면 '너'.
+  const userLabel = nickname ? nickname : '너';
   const multiTurn = multiTurnEnabled();
 
   // ── 관측 지표 누적 + 종료 시 한 줄 로깅 ──
@@ -368,6 +381,7 @@ export async function diagnose(
   const tStep1 = Date.now();
   const step1Res = await (await openAiClient()).chat.completions.create({
     model: routerModel(),
+    ...reasoningOptions(routerModel(), 'AI_ROUTER_REASONING', 'low'),
     max_completion_tokens: maxCompletionTokens(),
     response_format: { type: 'json_object' },
     messages: [
@@ -456,6 +470,7 @@ export async function diagnose(
     const tStep2 = Date.now();
     const step2Res = await (await openAiClient()).chat.completions.create({
       model: generationModel(),
+      ...reasoningOptions(generationModel(), 'AI_GENERATION_REASONING', 'none'),
       max_completion_tokens: maxCompletionTokens(),
       messages: [
         { role: 'system', content: buildGeneratePrompt(contentBlocks, userLabel, { crisis, multiTurn }) },
