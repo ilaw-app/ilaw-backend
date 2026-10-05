@@ -89,7 +89,7 @@ describe('GET /community/my-posts', () => {
     ]);
   });
 
-  it('삭제·신고삭제된 댓글은 댓글 수에서 제외한다', async () => {
+  it('목록에서 감추는 댓글(욕설 블라인드·작성자 삭제)은 댓글 수에서도 제외한다', async () => {
     await request(app)
       .get('/community/my-posts')
       .set('Authorization', authorization('me'))
@@ -97,7 +97,7 @@ describe('GET /community/my-posts', () => {
 
     const [{ select }] = prismaMock.communityPost.findMany.mock.calls[0];
     expect(select._count.select.comments).toEqual({
-      where: { status: { notIn: ['removed', 'deleted'] } },
+      where: { status: { notIn: ['hidden', 'deleted'] } },
     });
   });
 });

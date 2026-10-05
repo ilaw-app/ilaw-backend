@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client';
 import prisma from '../prisma/client';
-import { ANONYMOUS_POST_AUTHOR, UNCOUNTED_COMMENT_STATUSES } from './community-shared';
+import { ANONYMOUS_POST_AUTHOR, DROPPED_COMMENT_STATUSES } from './community-shared';
 
 function isKnownRequestError(error: unknown, code: string): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === code;
@@ -85,7 +85,7 @@ export async function getMyBookmarks(userId: string) {
             select: {
               likes: true,
               bookmarks: true,
-              comments: { where: { status: { notIn: UNCOUNTED_COMMENT_STATUSES } } },
+              comments: { where: { status: { notIn: DROPPED_COMMENT_STATUSES } } },
             },
           },
         },

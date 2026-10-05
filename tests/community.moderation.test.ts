@@ -259,26 +259,36 @@ describe('비공개/삭제 댓글 표시 마스킹', () => {
     prismaMock.communityPost.findUnique.mockResolvedValue({ authorId: 'post-author' });
   });
 
-  it('욕설 블라인드(hidden) 댓글은 원문·좋아요를 가리고 욕설 안내문으로 대체한다', async () => {
-    prismaMock.communityComment.findMany.mockResolvedValue([commentRow({ id: 1, status: 'hidden' })]);
-
-    const [comment] = await communityService.listComments(1);
-
-    expect(comment.content).toBe('욕설이 감지되어 비공개된 댓글입니다.');
-    expect(comment.likes).toBe(0);
-  });
-
-  it('신고삭제(removed)·작성자삭제(deleted)는 각각 다른 안내문으로 대체한다', async () => {
+  it.each(['hidden', 'deleted'])('%s 댓글은 안내문도 남기지 않고 목록에서 뺀다', async (status) => {
     prismaMock.communityComment.findMany.mockResolvedValue([
-      commentRow({ id: 1, status: 'removed' }),
-      commentRow({ id: 2, status: 'deleted' }),
+      commentRow({ id: 1, status }),
+      commentRow({ id: 2, status: 'visible' }),
     ]);
 
     const roots = await communityService.listComments(1);
-    const byId = new Map(roots.map((c) => [c.id, c.content]));
 
-    expect(byId.get(1)).toBe('신고가 누적되어 삭제된 댓글입니다.');
-    expect(byId.get(2)).toBe('삭제된 댓글입니다.');
+    expect(roots.map((c) => c.id)).toEqual([2]);
+  });
+
+  it('신고삭제(removed)만 안내문으로 남고 원문·좋아요는 가린다', async () => {
+    prismaMock.communityComment.findMany.mockResolvedValue([commentRow({ id: 1, status: 'removed' })]);
+
+    const [comment] = await communityService.listComments(1);
+
+    expect(comment.content).toBe('신고가 누적되어 삭제된 댓글입니다.');
+    expect(comment.likes).toBe(0);
+  });
+
+  it('감춘 댓글의 답글은 최상위로 올라오지 않고 함께 사라진다', async () => {
+    prismaMock.communityComment.findMany.mockResolvedValue([
+      commentRow({ id: 1, status: 'hidden' }),
+      commentRow({ id: 2, status: 'visible', parentId: 1 }),
+      commentRow({ id: 3, status: 'visible' }),
+    ]);
+
+    const roots = await communityService.listComments(1);
+
+    expect(roots.map((c) => c.id)).toEqual([3]);
   });
 
   it('삭제된 부모 댓글은 안내문으로 남고 답글 스레드는 유지된다', async () => {

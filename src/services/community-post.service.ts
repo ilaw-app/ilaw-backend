@@ -1,7 +1,7 @@
 import prisma from '../prisma/client';
 import { checkProfanityFields } from './profanity';
 import { moderateAndBlind } from './moderation.service';
-import { ANONYMOUS_POST_AUTHOR, HIDDEN_POST_STATUSES, UNCOUNTED_COMMENT_STATUSES } from './community-shared';
+import { ANONYMOUS_POST_AUTHOR, HIDDEN_POST_STATUSES, DROPPED_COMMENT_STATUSES } from './community-shared';
 import { buildCommentTree, buildLabelMapFromComments } from './community-presenter';
 import { formatPoll, getVoteCounts, parsePollInput, PollDefinition, samePollOptions } from './community-poll.service';
 import { runCommunitySerializableTransaction } from './community-transaction';
@@ -26,7 +26,7 @@ export async function listPosts(page: number, limit: number) {
         _count: {
           select: {
             likes: true,
-            comments: { where: { status: { notIn: UNCOUNTED_COMMENT_STATUSES } } },
+            comments: { where: { status: { notIn: DROPPED_COMMENT_STATUSES } } },
             bookmarks: true,
           },
         },
@@ -230,7 +230,7 @@ export async function getMyPosts(userId: string) {
       _count: {
         select: {
           likes: true,
-          comments: { where: { status: { notIn: UNCOUNTED_COMMENT_STATUSES } } },
+          comments: { where: { status: { notIn: DROPPED_COMMENT_STATUSES } } },
           bookmarks: true,
         },
       },
