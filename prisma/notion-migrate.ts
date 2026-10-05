@@ -6,7 +6,7 @@ import { createHash } from 'crypto';
 import { S3Client, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { PrismaClient } from '@prisma/client';
 import { printScriptMode, resolveScriptMode } from './script-safety';
-import { planArticleSync } from './article-sync';
+import { articleMatchKey, planArticleSync } from './article-sync';
 import { backfillManualEmbeddings, hasEmbeddingApiKey, planEmbeddingBackfill } from './embed-manuals';
 import { buildPublicObjectUrl } from '../src/utils/storage-url';
 
@@ -96,12 +96,15 @@ async function parseHtmlFile(htmlFile: string, uploadImages = true) {
 
   const question = $('h1.page-title').text().trim();
 
-  let order = 0;
+  // 순서가 비어 있으면 null — 재적재 때 기존 행의 순서를 그대로 둔다(0 으로 덮어쓰지 않는다).
+  // 2026-10 재export 에서 63건이 순서 속성이 비어 있었다.
+  let order: number | null = null;
   let categoryName = '';
   $('tr.property-row').each((_, row) => {
     const label = $(row).find('th').text().trim();
     const value = $(row).find('td').text().trim();
-    if (label === 'order') order = parseInt(value) || 0;
+    // 노션 속성명 'order' → '순서'(2026-10 DB 복제 후). 둘 다 받는다.
+    if (label === 'order' || label === '순서') order = parseInt(value) || null;
     // 노션 속성명이 '카테고리' → 'category'로 바뀌었는데 기존 export 파일은 아직
     // 옛 이름을 쓴다. 재export 전까지 두 이름이 섞여 있어 둘 다 받는다.
     if (label === '카테고리' || label === 'category') categoryName = value.trim();
@@ -204,7 +207,8 @@ async function main() {
         invalidFiles.push(path.basename(htmlFile));
         continue;
       }
-      const key = `${parsed.categoryName} ${parsed.question}`;
+      // 재적재 매칭(article-sync)과 같은 느슨한 키로 중복을 본다.
+      const key = `${parsed.categoryName} ${articleMatchKey(parsed.question)}`;
       const previous = seenKeys.get(key);
       if (previous) {
         duplicateKeys.push(`"${parsed.question}" (${parsed.categoryName}): ${previous} / ${path.basename(htmlFile)}`);
@@ -228,7 +232,7 @@ async function main() {
     question: string;
     summary: string | null;
     content: string;
-    order: number;
+    order: number | null;
     categoryName: string;
   }> = [];
   for (const htmlFile of htmlFiles) {
@@ -258,7 +262,7 @@ async function main() {
     // onDelete: Cascade라 사용자 스크랩이 통째로 사라지고 임베딩도 전부 재생성된다.
     const existing = await transaction.manualArticle.findMany({
       where: { categoryId: { in: Object.values(categoryMap) } },
-      select: { id: true, categoryId: true, question: true },
+      select: { id: true, categoryId: true, question: true, order: true },
     });
     const plan = planArticleSync(
       existing,
@@ -269,12 +273,18 @@ async function main() {
     );
 
     for (const article of plan.toCreate) {
-      await transaction.manualArticle.create({ data: article });
+      await transaction.manualArticle.create({ data: { ...article, order: article.order ?? 0 } });
     }
-    for (const { id, article } of plan.toUpdate) {
+    for (const { id, article, previous } of plan.toUpdate) {
+      // 제목이 조금 바뀐 경우(❓ 제거 등)에도 같은 글로 매칭됐으므로 제목까지 새 값으로 맞춘다.
       await transaction.manualArticle.update({
         where: { id },
-        data: { summary: article.summary, content: article.content, order: article.order },
+        data: {
+          question: article.question,
+          summary: article.summary,
+          content: article.content,
+          order: article.order ?? previous.order,
+        },
       });
     }
     if (plan.toDeleteIds.length > 0) {

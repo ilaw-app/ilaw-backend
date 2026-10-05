@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planArticleSync } from '../prisma/article-sync';
+import { articleMatchKey, planArticleSync } from '../prisma/article-sync';
 
 const EXISTING = [
   { id: 10, categoryId: 1, question: '질문 A' },
@@ -17,7 +17,7 @@ describe('매뉴얼 재적재 계획', () => {
 
     expect(plan.toCreate).toEqual([]);
     expect(plan.toUpdate).toEqual([
-      { id: 10, article: { categoryId: 1, question: '질문 A', content: '수정된 본문' } },
+      { id: 10, article: { categoryId: 1, question: '질문 A', content: '수정된 본문' }, previous: EXISTING[0] },
     ]);
   });
 
@@ -60,5 +60,33 @@ describe('매뉴얼 재적재 계획', () => {
     expect(plan.toCreate).toHaveLength(1);
     expect(plan.toUpdate).toEqual([]);
     expect(plan.toDeleteIds).toEqual([]);
+  });
+
+  // 2026-10 노션 재export: 제목 앞 "❓"가 빠지고 물음표가 바뀐 글이 있었다. 엄격 비교면
+  // 삭제+생성이 되어 스크랩과 임베딩을 잃으므로, 이모지·공백·문장부호를 무시하고 같은 글로 본다.
+  it('제목의 이모지·공백·문장부호만 다르면 같은 글로 보고 갱신한다', () => {
+    const existing = [{ id: 20, categoryId: 1, question: '❓고등학교를 자퇴한 뒤 다시 학교에 다닐 수 있나요', order: 7 }];
+    const plan = planArticleSync(existing, [incoming(1, '고등학교를 자퇴한 뒤 다시 학교에 다닐 수 있나요?')]);
+
+    expect(plan.toCreate).toEqual([]);
+    expect(plan.toDeleteIds).toEqual([]);
+    expect(plan.toUpdate).toEqual([
+      {
+        id: 20,
+        article: { categoryId: 1, question: '고등학교를 자퇴한 뒤 다시 학교에 다닐 수 있나요?', content: '본문' },
+        previous: existing[0],
+      },
+    ]);
+  });
+
+  it('느슨한 키가 같은 글이 둘 들어오면 두 번째는 새 글로 만든다(기존 행을 두 번 갱신하지 않는다)', () => {
+    const plan = planArticleSync(EXISTING, [incoming(1, '질문 A'), incoming(1, '질문 A?')]);
+
+    expect(plan.toUpdate.map((entry) => entry.id)).toEqual([10]);
+    expect(plan.toCreate).toEqual([{ categoryId: 1, question: '질문 A?', content: '본문' }]);
+  });
+
+  it('articleMatchKey 는 글자와 숫자만 남긴다', () => {
+    expect(articleMatchKey('❓ 15세 미만 청소년도 아르바이트를 할 수 있나요?')).toBe('15세미만청소년도아르바이트를할수있나요');
   });
 });
